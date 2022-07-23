@@ -19,11 +19,9 @@ sleep 10
 
 ARCH=$(uname -m)
 
-IP_ADDRESS=$(hostname -I | awk '{ print $1 }')
+BINARY_DOCKER=$(which docker)
 
-BINARY_DOCKER=/usr/bin/docker
-
-DOCKER_REPO=homeassistant
+DOCKER_REPO="ghcr.io/home-assistant"
 
 SERVICE_DOCKER="docker.service"
 SERVICE_NM="NetworkManager.service"
@@ -33,9 +31,10 @@ FILE_INTERFACES="/etc/network/interfaces"
 FILE_NM_CONF="/etc/NetworkManager/NetworkManager.conf"
 FILE_NM_CONNECTION="/etc/NetworkManager/system-connections/default"
 
-URL_RAW_BASE="https://raw.githubusercontent.com/home-assistant/supervised-installer/master/files"
+URL_RAW_BASE="https://raw.githubusercontent.com/othiman/home-assistant-supervised-installer/main/files"
 URL_VERSION_HOST="version.home-assistant.io"
 URL_VERSION="https://${URL_VERSION_HOST}/stable.json"
+HASSIO_VERSION=$(curl -s ${URL_VERSION} | jq -e -r '.supervisor')
 URL_BIN_APPARMOR="${URL_RAW_BASE}/hassio-apparmor"
 URL_BIN_HASSIO="${URL_RAW_BASE}/hassio-supervisor"
 URL_DOCKER_DAEMON="${URL_RAW_BASE}/docker_daemon.json"
@@ -68,26 +67,6 @@ if systemctl is-enabled ModemManager.service &> /dev/null; then
     warn "ModemManager service is enabled. This might cause issue when using serial devices."
 fi
 
-# Detect wrong docker logger config
-if [ ! -f "$FILE_DOCKER_CONF" ]; then
-  # Write default configuration
-  info "Creating default docker daemon configuration $FILE_DOCKER_CONF"
-  curl -sL ${URL_DOCKER_DAEMON} > "${FILE_DOCKER_CONF}"
-
-  # Restart Docker service
-  info "Restarting docker service"
-  systemctl restart "$SERVICE_DOCKER"
-else
-  STORAGE_DRIVER=$(docker info -f "{{json .}}" | jq -r -e .Driver)
-  LOGGING_DRIVER=$(docker info -f "{{json .}}" | jq -r -e .LoggingDriver)
-  if [[ "$STORAGE_DRIVER" != "overlay2" ]]; then
-    warn "Docker is using $STORAGE_DRIVER and not 'overlay2' as the storage driver, this is not supported."
-  fi
-  if [[ "$LOGGING_DRIVER"  != "journald" ]]; then
-    warn "Docker is using $LOGGING_DRIVER and not 'journald' as the logging driver, this is not supported."
-  fi
-fi
-
 # Check dmesg access
 if [[ "$(sysctl --values kernel.dmesg_restrict)" != "0" ]]; then
     info "Fix kernel dmesg restriction"
@@ -113,8 +92,37 @@ if [[ "$answer" =~ "y" ]] || [[ "$answer" =~ "Y" ]]; then
     curl -sL "${URL_INTERFACES}" > "${FILE_INTERFACES}";
 fi
 
+
+# Restart NetworkManager
 info "Restarting NetworkManager"
 systemctl restart "${SERVICE_NM}"
+
+# Enable and start systemd-resolved
+if [ "$(systemctl is-active systemd-resolved)" = 'inactive' ]; then
+    info "Enable systemd-resolved"
+    systemctl enable systemd-resolved.service> /dev/null 2>&1;
+    systemctl start systemd-resolved.service> /dev/null 2>&1;
+fi
+
+# Detect wrong docker logger config
+if [ ! -f "$FILE_DOCKER_CONF" ]; then
+  # Write default configuration
+  info "Creating default docker daemon configuration $FILE_DOCKER_CONF"
+  curl -sL ${URL_DOCKER_DAEMON} > "${FILE_DOCKER_CONF}"
+
+  # Restart Docker service
+  info "Restarting docker service"
+  systemctl restart "$SERVICE_DOCKER"
+else
+  STORAGE_DRIVER=$(docker info -f "{{json .}}" | jq -r -e .Driver)
+  LOGGING_DRIVER=$(docker info -f "{{json .}}" | jq -r -e .LoggingDriver)
+  if [[ "$STORAGE_DRIVER" != "overlay2" ]]; then
+    warn "Docker is using $STORAGE_DRIVER and not 'overlay2' as the storage driver, this is not supported."
+  fi
+  if [[ "$LOGGING_DRIVER"  != "journald" ]]; then
+    warn "Docker is using $LOGGING_DRIVER and not 'journald' as the logging driver, this is not supported."
+  fi
+fi
 
 # Parse command line parameters
 while [[ $# -gt 0 ]]; do
@@ -144,43 +152,53 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-PREFIX=${PREFIX:-/usr}
-SYSCONFDIR=${SYSCONFDIR:-/etc}
-DATA_SHARE=${DATA_SHARE:-$PREFIX/share/hassio}
-CONFIG=$SYSCONFDIR/hassio.json
+# Check network connection
+while ! ping -c 1 -W 1 ${URL_VERSION_HOST}; do
+    info "Waiting for ${URL_VERSION_HOST} - network interface might be down..."
+    sleep 2
+done
+HASSIO_VERSION=$(curl -s $URL_VERSION | jq -e -r '.supervisor')
+
+# Get primary network interface
+PRIMARY_INTERFACE=$(ip route | awk '/^default/ { print $5; exit }')
+IP_ADDRESS=$(ip -4 addr show dev "${PRIMARY_INTERFACE}" | awk '/inet / { sub("/.*", "", $2); print $2 }')
 
 # Generate hardware options
-case $ARCH in
+case ${ARCH} in
     "i386" | "i686")
         MACHINE=${MACHINE:=qemux86}
-        HASSIO_DOCKER="$DOCKER_REPO/i386-hassio-supervisor"
+        HASSIO_DOCKER="${DOCKER_REPO}/i386-hassio-supervisor"
     ;;
     "x86_64")
         MACHINE=${MACHINE:=qemux86-64}
-        HASSIO_DOCKER="$DOCKER_REPO/amd64-hassio-supervisor"
+        HASSIO_DOCKER="${DOCKER_REPO}/amd64-hassio-supervisor"
     ;;
     "arm" |"armv6l")
-        if [ -z $MACHINE ]; then
+        if [ -z ${MACHINE} ]; then
             error "Please set machine for $ARCH"
         fi
-        HASSIO_DOCKER="$DOCKER_REPO/armhf-hassio-supervisor"
+        HASSIO_DOCKER="${DOCKER_REPO}/armhf-hassio-supervisor"
     ;;
     "armv7l")
-        if [ -z $MACHINE ]; then
+        if [ -z ${MACHINE} ]; then
             error "Please set machine for $ARCH"
         fi
-        HASSIO_DOCKER="$DOCKER_REPO/armv7-hassio-supervisor"
+        HASSIO_DOCKER="${DOCKER_REPO}/armv7-hassio-supervisor"
     ;;
     "aarch64")
-        if [ -z $MACHINE ]; then
+        if [ -z ${MACHINE} ]; then
             error "Please set machine for $ARCH"
         fi
-        HASSIO_DOCKER="$DOCKER_REPO/aarch64-hassio-supervisor"
+        HASSIO_DOCKER="${DOCKER_REPO}/aarch64-hassio-supervisor"
     ;;
     *)
-        error "$ARCH unknown!"
+        error "${ARCH} unknown!"
     ;;
 esac
+PREFIX=${PREFIX:-/usr}
+SYSCONFDIR=${SYSCONFDIR:-/etc}
+DATA_SHARE=${DATA_SHARE:-$PREFIX/share/hassio}
+CONFIG="${SYSCONFDIR}/hassio.json"
 
 if [[ ! "${MACHINE}" =~ ^(generic-x86-64|odroid-c2|odroid-n2|odroid-xu|qemuarm|qemuarm-64|qemux86|qemux86-64|raspberrypi|raspberrypi2|raspberrypi3|raspberrypi4|raspberrypi3-64|raspberrypi4-64|tinker|khadas-vim3)$ ]]; then
     error "Unknown machine type ${MACHINE}!"
@@ -200,16 +218,10 @@ fi
 if [ ! -d "${PREFIX}/bin" ]; then
     mkdir -p "${PREFIX}/bin"
 fi
-# Read infos from web
-while ! ping -c 1 -W 1 ${URL_VERSION_HOST}; do
-    info "Waiting for ${URL_VERSION_HOST} - network interface might be down..."
-    sleep 2
-done
-HASSIO_VERSION=$(curl -s $URL_VERSION | jq -e -r '.supervisor')
 
 ##
 # Write configuration
-cat > "$CONFIG" <<- EOF
+cat > "${CONFIG}" <<- EOF
 {
     "supervisor": "${HASSIO_DOCKER}",
     "machine": "${MACHINE}",
@@ -217,11 +229,6 @@ cat > "$CONFIG" <<- EOF
 }
 EOF
 
-##
-# Pull supervisor image
-info "Install supervisor Docker container"
-docker pull "$HASSIO_DOCKER:$HASSIO_VERSION" > /dev/null
-docker tag "$HASSIO_DOCKER:$HASSIO_VERSION" "$HASSIO_DOCKER:latest" > /dev/null
 
 ##
 # Install Hass.io Supervisor
@@ -238,7 +245,7 @@ sed -i -e "s,%%BINARY_DOCKER%%,${BINARY_DOCKER},g" \
 chmod a+x "${PREFIX}/sbin/hassio-supervisor"
 systemctl enable hassio-supervisor.service > /dev/null 2>&1;
 
-#
+##
 # Install Hass.io AppArmor
 info "Install AppArmor scripts"
 mkdir -p "${DATA_SHARE}/apparmor"
@@ -255,9 +262,8 @@ chmod a+x "${PREFIX}/sbin/hassio-apparmor"
 systemctl enable hassio-apparmor.service > /dev/null 2>&1;
 systemctl start hassio-apparmor.service
 
-
 ##
-# Init system
+# Start Hass.io Supervisor 
 info "Start Home Assistant Supervised"
 systemctl start hassio-supervisor.service
 
@@ -268,7 +274,7 @@ curl -sL ${URL_HA} > "${PREFIX}/bin/ha"
 chmod a+x "${PREFIX}/bin/ha"
 
 info
-info "Home Assistant supervised is now installed"
-info "First setup will take some time, when it's ready you can reach it here:"
-info "http://${IP_ADDRESS}:8123"
+info "Within a few minutes you will be able to reach Home Assistant at:"
+info "http://homeassistant.local:8123 or using the IP address of your"
+info "machine: http://${IP_ADDRESS}:8123"
 info
